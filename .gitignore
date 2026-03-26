@@ -1,0 +1,15 @@
+# Test result HTML files
+*.html
+
+# Large assets
+DIV2K_valid_HR/
+fonts/
+
+# Zip archives (legacy distribution method)
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
