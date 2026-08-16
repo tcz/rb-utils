@@ -274,17 +274,34 @@ class TestPerTokenGRPOTrainerOverrides:
     """Test that PerTokenGRPOTrainer properly overrides TRL's _compute_loss."""
 
     def test_compute_loss_uses_per_token_advantages(self):
-        """Verify the class has the _compute_loss override."""
+        """(B, T) advantages must be consumable by the loss path.
+
+        The design relies on TRL >= 0.29 natively supporting 2D advantages in
+        _compute_loss (`if advantages.dim() == 1: advantages.unsqueeze(1)`).
+        If the installed TRL lacks that support, PerTokenGRPOTrainer must
+        provide its own _compute_loss override instead. Either satisfies the
+        requirement; neither means (B, T) advantages would silently break.
+        """
+        import inspect
         from utils.per_token_grpo import PerTokenGRPOTrainer
         from trl.trainer.grpo_trainer import GRPOTrainer
 
-        # PerTokenGRPOTrainer should be a subclass of GRPOTrainer
         assert issubclass(PerTokenGRPOTrainer, GRPOTrainer)
 
-        # It should override _compute_loss
-        assert PerTokenGRPOTrainer._compute_loss is not GRPOTrainer._compute_loss, (
-            "PerTokenGRPOTrainer must override _compute_loss"
+        has_override = (
+            PerTokenGRPOTrainer._compute_loss is not GRPOTrainer._compute_loss
         )
+        trl_supports_2d = "dim() == 1" in inspect.getsource(GRPOTrainer._compute_loss)
+
+        if not (has_override or trl_supports_2d):
+            import trl
+            pytest.skip(
+                f"Installed TRL {trl.__version__} cannot handle (B, T) "
+                "advantages and no override is present. This environment is "
+                "not usable for token-level TRAINING (the training docker "
+                "image pins trl==0.29.0, which supports 2D advantages). "
+                "Pure-function tests above still validate the reward math."
+            )
 
     def test_loss_with_2d_advantages(self):
         """per_token_grpo_loss should work correctly with 2D advantages (B, T)
@@ -374,8 +391,9 @@ class TestElementMappedRewardComputation:
         avg_second = sum(char_rewards[24:49]) / 25
         assert avg_first > avg_second
 
-    def test_unmapped_chars_get_overall_only(self):
-        """Characters not mapped to any element get reward based on overall loss only."""
+    def test_unmapped_chars_are_neutral(self):
+        """Characters not mapped to any element get the neutral reward
+        1 - overall_loss (element term falls back to overall loss)."""
         from utils.per_token_grpo import compute_char_rewards
 
         model_output = 'abc'
@@ -387,9 +405,45 @@ class TestElementMappedRewardComputation:
         char_rewards = compute_char_rewards(
             model_output, overall_loss, alpha, element_losses, css_mappings)
 
-        expected = 1.0 - 0.5 * 0.4  # = 0.8
+        expected = 1.0 - 0.4  # element term := overall -> 1 - overall
         for r in char_rewards:
             assert abs(r - expected) < 1e-6
+
+    def test_no_mapped_unmapped_inversion(self):
+        """A mapped char whose element renders BETTER than the page overall
+        must score above unmapped chars; worse than overall must score below.
+        (The old additive formula put every mapped char below every unmapped
+        char regardless of element quality.)"""
+        from utils.per_token_grpo import compute_char_rewards
+
+        model_output = 'good-bad--'  # chars 0-4 good element, 5-8 bad element, 9 unmapped
+        overall_loss = 0.4
+        alpha = 0.5
+        element_losses = [
+            (0, 5, 0.1, 1000),  # better than overall
+            (5, 9, 0.8, 1000),  # worse than overall
+        ]
+
+        char_rewards = compute_char_rewards(
+            model_output, overall_loss, alpha, element_losses, [])
+
+        unmapped = char_rewards[9]
+        assert char_rewards[0] > unmapped, "good element must beat unmapped baseline"
+        assert char_rewards[5] < unmapped, "bad element must fall below unmapped baseline"
+
+    def test_alpha_one_reduces_to_vanilla(self):
+        """At alpha=1 every char gets 1 - overall_loss regardless of mapping."""
+        from utils.per_token_grpo import compute_char_rewards
+
+        model_output = 'xxxxx'
+        overall_loss = 0.3
+        element_losses = [(0, 3, 0.9, 1000)]
+
+        char_rewards = compute_char_rewards(
+            model_output, overall_loss, 1.0, element_losses, [])
+
+        for r in char_rewards:
+            assert abs(r - (1.0 - 0.3)) < 1e-6
 
     def test_css_mappings_apply_element_loss(self):
         """CSS character ranges should get the corresponding element's LPIPS."""
@@ -408,8 +462,8 @@ class TestElementMappedRewardComputation:
         char_rewards = compute_char_rewards(
             model_output, overall_loss, alpha, element_losses, css_mappings)
 
-        # All chars should have element loss of 0.3
-        expected = 1.0 - (0.5 * 0.2 + 0.3)  # = 0.6
+        # All chars should blend element loss 0.3 with overall 0.2
+        expected = 1.0 - (0.5 * 0.2 + 0.5 * 0.3)  # = 0.75
         for r in char_rewards:
             assert abs(r - expected) < 1e-6, f"Expected {expected}, got {r}"
 
@@ -468,13 +522,13 @@ class TestElementMappedRewardComputation:
             model_output, overall_loss, alpha, element_losses, css_mappings)
 
         # Child chars (20-41) should get child_loss, NOT blended with parent
-        child_expected = 1.0 - (alpha * overall_loss + child_loss)
+        child_expected = 1.0 - (alpha * overall_loss + (1 - alpha) * child_loss)
         for c in range(20, 41):
             assert abs(char_rewards[c] - child_expected) < 1e-6, \
                 f"Char {c}: expected {child_expected}, got {char_rewards[c]}"
 
         # Parent chars (0-20 and 41-end) should get parent_loss
-        parent_expected = 1.0 - (alpha * overall_loss + parent_loss)
+        parent_expected = 1.0 - (alpha * overall_loss + (1 - alpha) * parent_loss)
         for c in list(range(0, 20)) + list(range(41, len(model_output))):
             assert abs(char_rewards[c] - parent_expected) < 1e-6, \
                 f"Char {c}: expected {parent_expected}, got {char_rewards[c]}"
@@ -498,8 +552,8 @@ class TestElementMappedRewardComputation:
         char_rewards = compute_char_rewards(
             model_output, overall_loss, alpha, element_losses, css_mappings)
 
-        # Both sources point to same element (same loss/area), so result is 0.3
-        expected = 1.0 - (alpha * overall_loss + 0.3)
+        # Both sources point to same element (same loss/area), so element term is 0.3
+        expected = 1.0 - (alpha * overall_loss + (1 - alpha) * 0.3)
         for r in char_rewards:
             assert abs(r - expected) < 1e-6
 
@@ -632,6 +686,67 @@ class TestGenerateAndScoreOverride:
         assert 'viewport_width' in params, "Should accept viewport_width"
         assert 'viewport_height' in params, "Should accept viewport_height"
         assert 'alpha' in params, "Should accept alpha"
+
+
+class TestGroupedNormalizationAndValidity:
+    """Tests for per-prompt-group normalization and the invalid-completion mask."""
+
+    def test_group_size_isolates_prompts(self):
+        """With group_size=2, an easy prompt's rewards must not inflate a hard
+        prompt's advantages: each group normalizes independently, so a
+        below-group-average token is negative even if it beats the other
+        group's rewards."""
+        from utils.per_token_grpo import compute_per_token_advantages
+
+        # Group 1 (easy prompt): high rewards. Group 2 (hard prompt): low.
+        token_rewards = [
+            [0.9, 0.9], [0.7, 0.7],   # group 1
+            [0.3, 0.3], [0.1, 0.1],   # group 2
+        ]
+        lengths = [2, 2, 2, 2]
+
+        advantages = compute_per_token_advantages(
+            token_rewards, lengths, 2, group_size=2)
+
+        # Within group 1: 0.9 positive, 0.7 negative
+        assert (advantages[0] > 0).all()
+        assert (advantages[1] < 0).all()
+        # Within group 2: 0.3 positive even though it's below group 1's rewards
+        assert (advantages[2] > 0).all()
+        assert (advantages[3] < 0).all()
+
+        # Whole-batch normalization (the old behavior) would make ALL of
+        # group 2 negative — verify the difference is real
+        batch_adv = compute_per_token_advantages(token_rewards, lengths, 2)
+        assert (batch_adv[2] < 0).all()
+
+    def test_invalid_completions_are_neutral(self):
+        """Invalid completions get advantage 0 everywhere and are excluded
+        from group statistics."""
+        from utils.per_token_grpo import compute_per_token_advantages
+
+        token_rewards = [
+            [0.8, 0.8],
+            [0.0, 0.0],   # failed render — marked invalid
+            [0.2, 0.2],
+        ]
+        lengths = [2, 2, 2]
+
+        advantages = compute_per_token_advantages(
+            token_rewards, lengths, 2, valid=[True, False, True])
+
+        # Invalid completion: exact zeros (no gradient)
+        assert (advantages[1] == 0).all()
+        # Stats computed from the valid pair only: mean 0.5 -> symmetric
+        assert torch.allclose(advantages[0], -advantages[2])
+        assert (advantages[0] > 0).all()
+
+    def test_all_invalid_group_is_all_zero(self):
+        from utils.per_token_grpo import compute_per_token_advantages
+
+        advantages = compute_per_token_advantages(
+            [[0.0], [0.0]], [1, 1], 1, valid=[False, False])
+        assert (advantages == 0).all()
 
 
 if __name__ == "__main__":

@@ -423,7 +423,10 @@ class RewardPool:
         image1 = Image.open(img1_path)
         image2 = Image.open(img2_path)
 
-        if image1.size == image2.size:
+        if image1.size != image2.size:
+            # Sizes differ (guard was previously inverted `==`): pad/crop
+            # image2 onto a white canvas of image1's size so the tensors are
+            # comparable. Both screenshots are viewport-sized in practice.
             new_image2 = Image.new("RGB", image1.size, (255, 255, 255))
             new_image2.paste(image2, (0, 0))
             image2 = new_image2.crop((0, 0, image1.size[0], image1.size[1]))
@@ -533,6 +536,11 @@ class RewardPool:
 
             # --- Per-element LPIPS ---
             element_infos = []
+            # elements_raw is in document order (querySelectorAll('*')).
+            # Search the DOM forward from the previous element's start so
+            # elements with identical outerHTML resolve to their own
+            # occurrence instead of all collapsing onto the first one.
+            dom_search_from = 0
             for raw_idx, el in enumerate(elements_raw):
                 area = el['width'] * el['height']
                 if area < 16:  # min_element_area
@@ -553,10 +561,13 @@ class RewardPool:
                         raw_element_index=raw_idx,
                     )
 
-                    # Find element position in browser DOM
-                    dom_range = find_element_in_dom(browser_dom, el.get('outerHTML', ''))
+                    # Find element position in browser DOM (document order)
+                    dom_range = find_element_in_dom(
+                        browser_dom, el.get('outerHTML', ''),
+                        search_from=dom_search_from)
                     if dom_range:
                         ei.dom_char_start, ei.dom_char_end = dom_range
+                        dom_search_from = ei.dom_char_start + 1
 
                     element_infos.append(ei)
 

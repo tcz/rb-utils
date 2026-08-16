@@ -54,8 +54,15 @@ def calculate_similarity(image1, image2):
 
     return float(sim)
 
+_lpips_fn = None
+
 def calculate_perceptual_loss(image1, image2):
-    loss_fn_alex = lpips.LPIPS(net='alex', verbose=False)
+    # Cache the LPIPS model — re-instantiating it per call reloads AlexNet
+    # weights every time and dominated eval time in the sequential path.
+    global _lpips_fn
+    if _lpips_fn is None:
+        _lpips_fn = lpips.LPIPS(net='alex', verbose=False)
+    loss_fn_alex = _lpips_fn
     loss_fn_alex.to(image1.device)
 
     # Normalize to [-1, 1]
@@ -81,7 +88,11 @@ def metrics(image1_path, image2_path):
     image1 = Image.open(image1_path)
     image2 = Image.open(image2_path)
 
-    if image1.size == image2.size:
+    if image1.size != image2.size:
+        # Sizes differ (guard was previously inverted `==`, making this a
+        # dead no-op path): pad/crop image2 onto a white canvas of image1's
+        # size so the tensors are comparable. In practice both screenshots
+        # are viewport-sized and identical, so this rarely triggers.
         new_image2 = Image.new("RGB", image1.size, (255, 255, 255))
         new_image2.paste(image2, (0, 0))
         image2 = new_image2.crop((0, 0, image1.size[0], image1.size[1]))

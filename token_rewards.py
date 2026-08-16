@@ -271,7 +271,7 @@ def _find_closing_tag(dom: str, tag_name: str, after_opening_tag_end: int):
     return None
 
 
-def find_element_in_dom(browser_dom: str, element_html_prefix: str):
+def find_element_in_dom(browser_dom: str, element_html_prefix: str, search_from: int = 0):
     """
     Find where an element's outer HTML appears in the browser DOM.
 
@@ -281,13 +281,25 @@ def find_element_in_dom(browser_dom: str, element_html_prefix: str):
 
     Falls back to opening-tag-only range if the closing tag cannot be found.
     Returns None if the element is not found at all.
+
+    Args:
+        search_from: Start the search at this character offset. Callers that
+            process elements in document order should pass the previous
+            element's start position + 1 so that elements with identical
+            outerHTML resolve to their own occurrence instead of all
+            collapsing onto the first one. (A child's own occurrence lies
+            inside its parent's range, so document-order forward search
+            remains correct for nested elements.) Falls back to a global
+            search if nothing is found at or after the offset.
     """
     if not element_html_prefix or not browser_dom:
         return None
 
     # Try exact match first
     prefix = element_html_prefix[:200]  # Use first 200 chars of outerHTML
-    idx = browser_dom.find(prefix)
+    idx = browser_dom.find(prefix, search_from)
+    if idx < 0 and search_from > 0:
+        idx = browser_dom.find(prefix)  # fallback: global search
     if idx >= 0:
         return _resolve_element_range(browser_dom, idx)
 
@@ -296,7 +308,9 @@ def find_element_in_dom(browser_dom: str, element_html_prefix: str):
     match = re.match(r'<(\w+)([^>]*)>', prefix)
     if match:
         tag_pattern = f'<{match.group(1)}{match.group(2)}'
-        idx = browser_dom.find(tag_pattern)
+        idx = browser_dom.find(tag_pattern, search_from)
+        if idx < 0 and search_from > 0:
+            idx = browser_dom.find(tag_pattern)
         if idx >= 0:
             return _resolve_element_range(browser_dom, idx)
 
@@ -431,9 +445,14 @@ def get_css_mappings_via_cdp(page, elements_raw, model_output):
                     continue
                 css_text, sheet_offset = info
 
-                # Map the selector range
-                sel_range = rule.get("selectorList", {}).get("range")
-                if sel_range:
+                # Map each selector's range. (CDP puts ranges on the
+                # individual selectors, not on selectorList itself — the old
+                # `selectorList.range` lookup was dead code and selector text
+                # never mapped.)
+                for selector in rule.get("selectorList", {}).get("selectors", []):
+                    sel_range = selector.get("range")
+                    if not sel_range:
+                        continue
                     s, e = _source_range_to_offsets(css_text, sel_range)
                     s = max(0, min(s, len(css_text)))
                     e = max(s, min(e, len(css_text)))
@@ -579,6 +598,11 @@ def compute_token_rewards(
         # Per-element LPIPS (track raw index for CSS mapping)
         element_scores = []
         raw_idx_to_score = {}  # raw_element_index -> (lpips_score, area)
+        # elements_raw comes from querySelectorAll('*') and is therefore in
+        # document order. Track the previous element's start so identical
+        # outerHTML strings resolve to their own occurrence instead of all
+        # collapsing onto the first one.
+        dom_search_from = 0
         for raw_idx, el in enumerate(elements_raw):
             area = el['width'] * el['height']
             if area < min_element_area:
@@ -598,10 +622,12 @@ def compute_token_rewards(
                     lpips_score=el_lpips,
                 )
 
-                # Find element in browser DOM
-                dom_range = find_element_in_dom(browser_dom, el['outerHTML'])
+                # Find element in browser DOM (document-order forward search)
+                dom_range = find_element_in_dom(
+                    browser_dom, el['outerHTML'], search_from=dom_search_from)
                 if dom_range:
                     es.dom_char_start, es.dom_char_end = dom_range
+                    dom_search_from = es.dom_char_start + 1
 
                 element_scores.append(es)
 

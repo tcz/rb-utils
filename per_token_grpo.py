@@ -31,55 +31,76 @@ def compute_per_token_advantages(
     token_rewards: list[list[float]],
     completion_lengths: list[int],
     max_len: int,
+    group_size: int = None,
+    valid: list[bool] = None,
 ) -> torch.Tensor:
     """
     Group-relative normalization at the token level.
 
-    Collects ALL token rewards across G completions, computes group mean and
-    std, then normalizes each token individually:
-        A[k,t] = (r[k,t] - mean(all_rewards)) / std(all_rewards)
+    Collects all token rewards across the G completions OF ONE PROMPT GROUP,
+    computes group mean and std, then normalizes each token individually:
+        A[k,t] = (r[k,t] - mean(group_rewards)) / std(group_rewards)
 
     Padding positions get advantage = 0.0.
-    If std < 1e-8, all advantages are set to 0.0 (avoids division by zero).
+    If std < 1e-8, all advantages in that group are set to 0.0.
 
     Args:
-        token_rewards: list of G lists, each containing per-token reward floats.
-        completion_lengths: list of G ints (actual non-padded lengths).
+        token_rewards: list of B lists, each containing per-token reward floats.
+        completion_lengths: list of B ints (actual non-padded lengths).
         max_len: int for padding dimension.
+        group_size: completions per prompt group (num_generations). The batch
+            is normalized in consecutive chunks of this size, matching TRL's
+            RepeatSampler layout. If None, the whole batch is treated as one
+            group (only correct when the batch contains a single prompt —
+            normalizing across prompts reintroduces the prompt-difficulty
+            bias that group-relative normalization exists to remove).
+        valid: optional list of B bools. Invalid completions (failed render,
+            failed alignment, failed tokenization) are excluded from the
+            group statistics and receive advantage 0.0 everywhere — a true
+            neutral, rather than a spuriously extreme reward.
 
     Returns:
-        torch.Tensor of shape (G, max_len) with per-token advantages.
+        torch.Tensor of shape (B, max_len) with per-token advantages.
     """
-    G = len(token_rewards)
+    B = len(token_rewards)
+    if valid is None:
+        valid = [True] * B
+    if group_size is None or group_size <= 0:
+        group_size = B
+    if B % group_size != 0:
+        # Defensive: fall back to one group rather than silently misgrouping
+        group_size = B
 
-    # Flatten all rewards to compute group statistics
-    all_rewards = []
-    for k in range(G):
-        length = completion_lengths[k]
-        all_rewards.extend(token_rewards[k][:length])
+    advantages = torch.zeros(B, max_len, dtype=torch.float32)
 
-    if len(all_rewards) == 0:
-        return torch.zeros(G, max_len)
+    for g0 in range(0, B, group_size):
+        idxs = range(g0, min(g0 + group_size, B))
 
-    all_rewards_t = torch.tensor(all_rewards, dtype=torch.float32)
-    mu = all_rewards_t.mean()
-    # correction=0 (population std): the token pool across all G completions
-    # for this prompt IS the full population, not a sample from a larger set.
-    # With ~48K tokens (6 completions × 8K tokens), the difference from
-    # TRL's default correction=1 is negligible (~0.001%).
-    sigma = all_rewards_t.std(correction=0)
+        group_rewards = []
+        for k in idxs:
+            if not valid[k]:
+                continue
+            length = min(completion_lengths[k], len(token_rewards[k]))
+            group_rewards.extend(token_rewards[k][:length])
 
-    # Build the (G, max_len) advantage tensor
-    advantages = torch.zeros(G, max_len, dtype=torch.float32)
+        if not group_rewards:
+            continue
 
-    if sigma < 1e-8:
-        # No variance — all advantages stay 0
-        return advantages
+        rewards_t = torch.tensor(group_rewards, dtype=torch.float32)
+        mu = rewards_t.mean()
+        # correction=0 (population std): the token pool across the group's
+        # completions IS the full population for this prompt.
+        sigma = rewards_t.std(correction=0)
 
-    for k in range(G):
-        length = completion_lengths[k]
-        for t in range(min(length, len(token_rewards[k]))):
-            advantages[k, t] = (token_rewards[k][t] - mu) / sigma
+        if sigma < 1e-8:
+            continue  # no variance — advantages stay 0 for this group
+
+        for k in idxs:
+            if not valid[k]:
+                continue
+            length = min(completion_lengths[k], len(token_rewards[k]))
+            for t in range(length):
+                advantages[k, t] = (token_rewards[k][t] - mu) / sigma
 
     return advantages
 
@@ -156,9 +177,25 @@ def compute_char_rewards(
 
     For each character in model_output:
     - If mapped to element(s) via HTML range or CSS mapping:
-        r_c = 1 - (alpha * overall_loss + weighted_element_loss)
-      where weighted_element_loss is area-weighted average of all mapped elements.
-    - If unmapped: r_c = 1 - alpha * overall_loss
+        r_c = 1 - (alpha * overall_loss + (1 - alpha) * weighted_element_loss)
+      where weighted_element_loss is the area-weighted average of all mapped
+      elements' LPIPS.
+    - If unmapped: the element term falls back to the overall loss:
+        r_c = 1 - (alpha * overall_loss + (1 - alpha) * overall_loss)
+            = 1 - overall_loss
+
+    Why the convex blend (this replaces the earlier additive formula
+    `1 - (alpha*overall + element)` with unmapped `1 - alpha*overall`):
+    the additive version put mapped and unmapped characters on different
+    reward scales — any mapped character scored strictly below any unmapped
+    character (element_loss > 0 always), so after group normalization
+    boilerplate/unmapped tokens received systematically positive advantages
+    relative to tokens that produced well-rendered elements. The convex
+    blend keeps every character on the same [0, 1] scale: unmapped
+    characters are exactly neutral (they carry the completion-level signal
+    only), and mapped characters score above/below that baseline according
+    to whether their element rendered better/worse than the page overall.
+    At alpha = 1 the formula reduces to vanilla GRPO for all tokens.
 
     Element mapping comes from two sources:
     1. element_losses: direct HTML char ranges (start, end, lpips, area).
@@ -173,8 +210,7 @@ def compute_char_rewards(
     Args:
         model_output: The model's generated text.
         overall_loss: Full-image LPIPS loss for this completion.
-        alpha: Blending weight for overall loss (0 = pure element-level,
-               1 = overall dominates).
+        alpha: Blend weight (1 = pure overall/vanilla, 0 = pure element-level).
         element_losses: List of (char_start, char_end, lpips_score, area) tuples.
             Each defines an HTML element's character range and its visual quality.
         css_mappings: List of (char_start, char_end, element_index) tuples.
@@ -216,24 +252,26 @@ def compute_char_rewards(
         for c in range(clamped_start, clamped_end):
             char_elements[c].append((lpips_score, area))
 
-    # Compute per-character rewards
+    # Compute per-character rewards (convex blend, see docstring)
     char_rewards = []
     for c in range(n):
         mappings = char_elements[c]
         if not mappings:
-            # Unmapped: reward based on overall loss only
-            char_rewards.append(1.0 - alpha * overall_loss)
+            # Unmapped: element term falls back to overall loss (neutral)
+            element_term = overall_loss
         else:
             # Area-weighted average (HTML contributes one entry, CSS may add more)
             total_area = sum(area for _, area in mappings)
             if total_area < 1e-12:
                 # Degenerate case: zero-area elements, use simple average
-                weighted_loss = sum(lpips for lpips, _ in mappings) / len(mappings)
+                element_term = sum(lpips for lpips, _ in mappings) / len(mappings)
             else:
-                weighted_loss = (
+                element_term = (
                     sum(lpips * area for lpips, area in mappings) / total_area
                 )
-            char_rewards.append(1.0 - (alpha * overall_loss + weighted_loss))
+        reward = 1.0 - (alpha * overall_loss + (1.0 - alpha) * element_term)
+        # LPIPS can occasionally exceed 1.0 — keep rewards in [0, 1]
+        char_rewards.append(max(0.0, min(1.0, reward)))
 
     return char_rewards
 
@@ -287,9 +325,12 @@ class ElementMappedGRPOTrainer(PerTokenGRPOTrainer):
 
     The alpha parameter controls the blend between overall image loss and
     element-specific loss in the per-character reward formula:
-        r_c = 1 - (alpha * overall_loss + element_loss)
-    - alpha=0: pure element-level reward (unmapped chars get reward=1.0)
-    - alpha=1: overall loss fully included (unmapped chars get 1-overall_loss)
+        r_c = 1 - (alpha * overall_loss + (1 - alpha) * element_term)
+    where element_term is the area-weighted element LPIPS for mapped
+    characters and falls back to overall_loss for unmapped characters.
+    - alpha=0: pure element-level reward (unmapped chars are neutral at
+      1 - overall_loss)
+    - alpha=1: reduces exactly to vanilla GRPO (uniform 1 - overall_loss)
 
     Overrides _generate_and_score_completions() to:
     1. Call super() for vanilla generation and scoring (scalar advantages)
@@ -358,8 +399,15 @@ class ElementMappedGRPOTrainer(PerTokenGRPOTrainer):
                           f"Falling back to scalar advantages.")
             return output
 
-        # Step 5: For each completion, compute per-token rewards
+        # Step 5: For each completion, compute per-token rewards.
+        # Completions that fail anywhere in the pipeline (render, alignment,
+        # tokenization, offset verification) are marked invalid: they are
+        # excluded from the group statistics and get advantage 0.0 everywhere
+        # (a true neutral — no gradient), instead of a spuriously extreme
+        # reward that conflates infrastructure failures with bad output.
         all_token_rewards = []
+        valid_flags = []
+        n_offset_mismatch = 0
         completion_lengths = completion_mask.sum(dim=1).tolist()  # actual non-padded lengths
 
         for i in range(B):
@@ -368,12 +416,8 @@ class ElementMappedGRPOTrainer(PerTokenGRPOTrainer):
             actual_len = int(completion_lengths[i])
 
             if token_result is None or not text.strip():
-                # Fallback: use scalar advantage as uniform per-token reward.
-                # The scalar advantage from super() is stored in output["advantages"].
-                # Use the scalar reward (1 - perceptual_loss) as uniform token rewards.
-                # We can't recover the exact scalar reward here, so use 0.0 (neutral).
-                # These will be normalized anyway via group-relative normalization.
                 all_token_rewards.append([0.0] * actual_len)
+                valid_flags.append(False)
                 continue
 
             overall_loss = token_result.perceptual_loss
@@ -387,6 +431,7 @@ class ElementMappedGRPOTrainer(PerTokenGRPOTrainer):
             except Exception as e:
                 warnings.warn(f"Alignment failed for completion {i}: {e}")
                 all_token_rewards.append([0.0] * actual_len)
+                valid_flags.append(False)
                 continue
 
             # Build element_losses: list of (model_char_start, model_char_end, lpips, area)
@@ -438,32 +483,53 @@ class ElementMappedGRPOTrainer(PerTokenGRPOTrainer):
                     text, return_offsets_mapping=True, add_special_tokens=False
                 )
                 offsets = encoding['offset_mapping']
+                reencoded_ids = encoding['input_ids']
             except Exception as e:
                 warnings.warn(f"Tokenization failed for completion {i}: {e}")
                 all_token_rewards.append([0.0] * actual_len)
+                valid_flags.append(False)
+                continue
+
+            # Verify the decode→re-encode round trip actually reproduces the
+            # generated token sequence. The offset mapping only means anything
+            # if re-encoded token k IS completion token k. Decoding skipped
+            # special tokens, so the re-encoded sequence should match the
+            # completion ids up to a trailing EOS (at most 1 token shorter).
+            actual_ids = completion_ids[i, :actual_len].tolist()
+            n_re = len(reencoded_ids)
+            round_trip_ok = (
+                actual_len - 1 <= n_re <= actual_len
+                and reencoded_ids == actual_ids[:n_re]
+            )
+            if not round_trip_ok:
+                n_offset_mismatch += 1
+                all_token_rewards.append([0.0] * actual_len)
+                valid_flags.append(False)
                 continue
 
             # Aggregate char rewards to token rewards
             token_rewards = char_rewards_to_token_rewards(char_rewards, offsets)
 
-            # The tokenizer may produce a different number of tokens than
-            # completion_ids has (due to padding, special tokens, etc.).
-            # Truncate or pad token_rewards to match actual_len.
-            if len(token_rewards) >= actual_len:
-                token_rewards = token_rewards[:actual_len]
-            else:
-                # Pad with global average
+            # Pad the (verified) 0-or-1 token gap — the trailing EOS — with
+            # this completion's average reward (neutral for that position).
+            if len(token_rewards) < actual_len:
                 avg = sum(token_rewards) / max(len(token_rewards), 1)
                 token_rewards.extend([avg] * (actual_len - len(token_rewards)))
 
             all_token_rewards.append(token_rewards)
+            valid_flags.append(True)
 
-        # Step 6: Compute per-token advantages via group-relative normalization
+        # Step 6: Compute per-token advantages via group-relative
+        # normalization — per prompt group (num_generations consecutive
+        # completions), matching TRL's RepeatSampler layout. Normalizing
+        # across the whole batch would reintroduce prompt-difficulty bias.
         max_len = T  # padded sequence length from completion_ids
         per_token_advantages = compute_per_token_advantages(
             all_token_rewards,
             [int(l) for l in completion_lengths],
             max_len,
+            group_size=self.num_generations,
+            valid=valid_flags,
         )
 
         # Replace scalar advantages with per-token advantages
@@ -472,12 +538,15 @@ class ElementMappedGRPOTrainer(PerTokenGRPOTrainer):
         # Log token-level metrics
         mode = "train" if self.model.training else "eval"
         # Fraction of completions that got element-level rewards (vs fallback)
-        n_element_mapped = sum(
-            1 for i in range(B)
-            if token_results[i] is not None and completions_text[i].strip()
-        )
+        n_element_mapped = sum(1 for v in valid_flags if v)
         self._metrics[mode]["token_rewards/element_mapped_ratio"].append(
             n_element_mapped / max(B, 1)
+        )
+        self._metrics[mode]["token_rewards/offset_mismatch_ratio"].append(
+            n_offset_mismatch / max(B, 1)
+        )
+        self._metrics[mode]["token_rewards/render_failed_ratio"].append(
+            sum(1 for i in range(B) if token_results[i] is None) / max(B, 1)
         )
 
         # Average number of elements per completion

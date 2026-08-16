@@ -274,3 +274,45 @@ body { margin: 0; }
         assert result is not None
         extracted = dom[result[0]:result[1]]
         assert extracted == dom
+
+
+class TestDuplicateElements:
+    """Duplicate outerHTML must resolve to distinct occurrences when the
+    caller supplies a document-order search_from offset."""
+
+    def test_identical_siblings_resolve_in_order(self):
+        el = '<div style="background:red;width:100px;height:100px"></div>'
+        dom = f'<body>{el}{el}{el}</body>'
+
+        first = find_element_in_dom(dom, el)
+        assert first is not None
+        second = find_element_in_dom(dom, el, search_from=first[0] + 1)
+        assert second is not None
+        third = find_element_in_dom(dom, el, search_from=second[0] + 1)
+        assert third is not None
+
+        starts = {first[0], second[0], third[0]}
+        assert len(starts) == 3, "each copy must map to its own occurrence"
+        assert first[0] < second[0] < third[0]
+
+    def test_nested_child_found_inside_parent_range(self):
+        """Document-order forward search must still find a child whose
+        occurrence lies inside its parent's range."""
+        child = '<div class="inner">x</div>'
+        parent = f'<div class="outer">{child}</div>'
+        dom = f'<body>{parent}</body>'
+
+        p_range = find_element_in_dom(dom, parent)
+        assert p_range is not None
+        c_range = find_element_in_dom(dom, child, search_from=p_range[0] + 1)
+        assert c_range is not None
+        assert p_range[0] < c_range[0] < c_range[1] <= p_range[1]
+
+    def test_search_from_falls_back_to_global(self):
+        """If nothing matches at/after the offset, fall back to a global search
+        rather than dropping the element."""
+        el = '<div class="only">x</div>'
+        dom = f'<body>{el}<span>tail</span></body>'
+        r = find_element_in_dom(dom, el, search_from=len(dom) - 3)
+        assert r is not None
+        assert dom[r[0]:r[1]].startswith('<div class="only">')
