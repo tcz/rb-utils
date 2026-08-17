@@ -19,8 +19,16 @@ from pathlib import Path
 import http.server
 
 PIL.Image.MAX_IMAGE_PIXELS = 1000000000
-WEB_SERVER_PORT = 3000
-VALIDATION_DATA_DIR = 'data-rb-validate'
+
+# Port for the local HTTP server that serves rendered HTML to Playwright.
+# Configurable via RB_WEB_SERVER_PORT so that multiple independent runs can
+# share one machine. This matters: the server's "address already in use"
+# handler assumes an existing server is serving THIS run's files, so two
+# runs sharing a port would serve each other's validation_data_dir —
+# producing 404s, blank screenshots, and silently wrong rewards rather than
+# an error. Give every co-located run its own port.
+WEB_SERVER_PORT = int(os.environ.get('RB_WEB_SERVER_PORT', '3000'))
+VALIDATION_DATA_DIR = os.environ.get('RB_VALIDATION_DATA_DIR', 'data-rb-validate')
 
 server_thread = None
 

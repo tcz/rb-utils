@@ -217,12 +217,50 @@ class RewardPool:
                     httpd.serve_forever()
             except OSError as e:
                 if e.errno in (98, 48):  # Address already in use
-                    return  # another server is running, that's fine
+                    # Verify the incumbent server actually serves OUR
+                    # validation dir. If another run owns this port, its
+                    # server would return 404 for our files and every
+                    # screenshot would be blank — silently corrupting all
+                    # rewards. Fail loudly instead. Give each co-located run
+                    # its own port via RB_WEB_SERVER_PORT.
+                    if self._verify_incumbent_server():
+                        return  # our own server (e.g. re-created pool) — fine
+                    raise RuntimeError(
+                        f"Port {self._web_server_port} is already in use by a "
+                        f"server that does not serve {self._validation_data_dir!r}. "
+                        f"Another run is probably using this port. Set "
+                        f"RB_WEB_SERVER_PORT to a free port for this run."
+                    )
                 import time as _time
                 _time.sleep(1)
             except Exception:
                 import time as _time
                 _time.sleep(1)
+
+    def _verify_incumbent_server(self):
+        """Check whether the server already on our port serves our directory.
+
+        Writes a probe file into validation_data_dir and fetches it over HTTP.
+        Returns True only if the incumbent server returns our exact content.
+        """
+        import urllib.request
+
+        probe_name = f"_probe_{uuid.uuid4().hex}.txt"
+        probe_path = os.path.join(self._validation_data_dir, probe_name)
+        token = uuid.uuid4().hex
+        try:
+            with open(probe_path, 'w') as f:
+                f.write(token)
+            url = f"http://localhost:{self._web_server_port}/{probe_name}"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                return resp.read().decode().strip() == token
+        except Exception:
+            return False
+        finally:
+            try:
+                os.remove(probe_path)
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     # Worker

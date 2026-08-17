@@ -465,3 +465,84 @@ class TestTokenLevelMode:
             assert isinstance(r, TokenLevelResult), f"Expected TokenLevelResult, got {type(r)}"
             assert r.similarity > 0
             assert r.perceptual_loss >= 0
+
+
+class TestPortIsolation:
+    """A second run must never silently share another run's HTTP server.
+
+    Sharing meant the incumbent server served ITS validation_data_dir, so the
+    newcomer's HTML files 404'd, screenshots came back blank, and every reward
+    was silently wrong. Collisions must now raise.
+    """
+
+    def test_probe_rejects_foreign_server(self, tmp_path):
+        import http.server
+        import threading
+        import functools
+        import socket
+        from utils.similarity_parallel import RewardPool
+
+        # A plain server on some port serving a DIFFERENT directory
+        foreign_dir = tmp_path / "foreign"
+        foreign_dir.mkdir()
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler,
+                                    directory=str(foreign_dir))
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        try:
+            ours = tmp_path / "ours"
+            ours.mkdir()
+            # Build a bare object with just the attributes _verify uses
+            probe = RewardPool.__new__(RewardPool)
+            probe._validation_data_dir = str(ours)
+            probe._web_server_port = port
+            assert probe._verify_incumbent_server() is False, (
+                "a server serving someone else's directory must not be "
+                "accepted as ours"
+            )
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_probe_accepts_own_server(self, tmp_path):
+        import http.server
+        import threading
+        import functools
+        import socket
+        from utils.similarity_parallel import RewardPool
+
+        ours = tmp_path / "ours"
+        ours.mkdir()
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler,
+                                    directory=str(ours))
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        try:
+            probe = RewardPool.__new__(RewardPool)
+            probe._validation_data_dir = str(ours)
+            probe._web_server_port = port
+            assert probe._verify_incumbent_server() is True
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_port_is_env_configurable(self, monkeypatch):
+        """RB_WEB_SERVER_PORT lets co-located runs pick distinct ports."""
+        import importlib
+        monkeypatch.setenv("RB_WEB_SERVER_PORT", "3457")
+        import utils.similarity as sim
+        importlib.reload(sim)
+        assert sim.WEB_SERVER_PORT == 3457
+        monkeypatch.delenv("RB_WEB_SERVER_PORT")
+        importlib.reload(sim)
+        assert sim.WEB_SERVER_PORT == 3000
